@@ -1,0 +1,60 @@
+# Example Ranger pipeline configuration
+# Reads a local CSV file and writes to a local JSON output
+
+pipeline:
+  name: example_csv_to_json
+  version: "1.0"
+  description: "Example pipeline: read CSV, write JSON"
+  owner: "ranger-team"
+  tags: ["example", "local"]
+
+source:
+  type: file
+  config:
+    path: "./data/sample.csv"
+    format: csv
+
+engine:
+  type: batch
+  config:
+    chunk_size: 5000
+  late_arrival:
+    strategy: append_with_flag
+    watermark_delay_seconds: 3600
+
+schema:
+  registry: duckdb
+  drift_handling:
+    compatible: auto_evolve
+    breaking: quarantine
+
+sink:
+  type: local
+  config:
+    path: "./output/example"
+    format: json
+
+quality:
+  rules:
+    - type: not_null
+      columns: ["id"]
+      action: reject
+  dedup:
+    strategy: primary_key
+    columns: ["id"]
+    keep: latest
+
+observability:
+  log_level: INFO
+  emit_lineage: true
+  drift_audit_table: "schema_drift_log"
+
+# Schedule is informational — consumed by your scheduler integration
+schedule:
+  cron: "0 6 * * *"
+  timezone: "America/Chicago"
+  scheduler: airflow
+  dag_id: ranger_example_csv
+  retries: 2
+  retry_delay_minutes: 5
+  tags: ["example"]
