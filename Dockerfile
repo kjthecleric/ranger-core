@@ -13,14 +13,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         librdkafka-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
+# Install uv for faster package installation
+RUN pip install --no-cache-dir uv
+
+# Copy dependency files
+COPY pyproject.toml README.md ./
 
 # Install the package with all optional extras (or change to a subset)
-RUN pip install --no-cache-dir --prefix=/install ".[all,dev]" 2>/dev/null \
-    || pip install --no-cache-dir --prefix=/install "." 
+# First try with all extras, then fall back to base install if that fails
+RUN uv pip install --no-cache-dir --prefix=/install ".[all,dev]" \
+    || uv pip install --no-cache-dir --prefix=/install "."
 
 COPY . /build
-RUN pip install --no-cache-dir --prefix=/install .
+RUN uv pip install --no-cache-dir --prefix=/install .
 
 # -------------------------------------------------------------------
 # Stage 2: Runtime
