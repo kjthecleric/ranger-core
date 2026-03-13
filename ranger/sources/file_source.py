@@ -1,15 +1,18 @@
 """File source — reads CSV, JSON, NDJSON, Parquet, Avro, XML, Excel, ORC files.
 
-Supports glob patterns, compression auto-detection, and multi-file ingestion.
+Supports glob patterns, compression auto-detection (.gz, .bz2, .zst, .zip),
+and multi-file ingestion.
 """
 
 from __future__ import annotations
 
+import bz2
 import csv
 import gzip
 import io
 import json
 import logging
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,6 +21,9 @@ from ranger.core.models import ColumnDefinition, ColumnType, DiscoveredSchema, R
 from ranger.sources.base import BaseSource
 
 logger = logging.getLogger(__name__)
+
+# Extensions that indicate compression (order matters for detection)
+_COMPRESSION_EXTENSIONS: set[str] = {".gz", ".bz2", ".zst", ".zip"}
 
 # Mapping from Python/inferred types to Ranger column types
 _TYPE_MAP: dict[str, ColumnType] = {
@@ -36,11 +42,12 @@ class FileSource(BaseSource):
         path: File path or glob pattern (e.g., 'data/*.csv').
         format: File format — csv, json, ndjson, parquet, avro, xml, excel, orc.
                 Auto-detected from extension if omitted.
-        compression: Compression type (auto, gz, bz2, zst, none).
+        compression: Compression type (auto, gz, bz2, zst, zip, none).
         csv_delimiter: Delimiter for CSV files (default: ',').
         csv_header: Whether CSV has a header row (default: true).
         xml_record_tag: XPath or tag name for record elements in XML.
         excel_sheet: Sheet name or index for Excel files.
+        excel_header_row: 1-based row number containing headers (default: 1).
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -91,7 +98,7 @@ class FileSource(BaseSource):
                 yield from self._read_csv(file_path)
             elif fmt == "json":
                 yield from self._read_json(file_path)
-            elif fmt == "ndjson" or fmt == "jsonl":
+            elif fmt in ("ndjson", "jsonl"):
                 yield from self._read_ndjson(file_path)
             elif fmt == "parquet":
                 yield from self._read_parquet(file_path)
@@ -119,7 +126,7 @@ class FileSource(BaseSource):
 
         # Infer types from sample
         columns: list[ColumnDefinition] = []
-        all_keys = set()
+        all_keys: set[str] = set()
         for row in sample:
             all_keys.update(row.keys())
 
@@ -144,15 +151,20 @@ class FileSource(BaseSource):
     # ------------------------------------------------------------------
 
     def _detect_format(self, path: Path) -> str:
+        """Detect file format from extension, stripping compression suffixes."""
         if self._format != "auto":
             return self._format
 
         suffix = path.suffix.lower()
-        if suffix == ".gz":
-            # Look at the stem extension
-            suffix = Path(path.stem).suffix.lower()
 
-        format_map = {
+        # Strip all known compression extensions to find the real format
+        stem = path
+        while stem.suffix.lower() in _COMPRESSION_EXTENSIONS:
+            stem = Path(stem.stem)
+
+        data_suffix = stem.suffix.lower()
+
+        format_map: dict[str, str] = {
             ".csv": "csv",
             ".json": "json",
             ".ndjson": "ndjson",
@@ -164,24 +176,83 @@ class FileSource(BaseSource):
             ".xls": "excel",
             ".orc": "orc",
         }
+
+        # If the outer extension is a compression extension, use the inner one
+        if suffix in _COMPRESSION_EXTENSIONS:
+            return format_map.get(data_suffix, "json")
+
         return format_map.get(suffix, "json")
+
+    # ------------------------------------------------------------------
+    # Compression
+    # ------------------------------------------------------------------
+
+    def _detect_compression(self, path: Path) -> str:
+        """Detect compression type from file extension."""
+        if self._compression != "auto":
+            return self._compression
+
+        suffix = path.suffix.lower()
+        compression_map: dict[str, str] = {
+            ".gz": "gz",
+            ".bz2": "bz2",
+            ".zst": "zst",
+            ".zip": "zip",
+        }
+        return compression_map.get(suffix, "none")
+
+    def _open_file(self, path: Path, mode: str = "rb") -> io.IOBase:
+        """Open a file, auto-detecting and handling compression.
+
+        Returns a file-like object that yields decompressed bytes.
+        """
+        compression = self._detect_compression(path)
+
+        if compression == "gz":
+            return gzip.open(path, mode)
+
+        if compression == "bz2":
+            return bz2.open(path, mode)
+
+        if compression == "zst":
+            try:
+                import zstandard as zstd
+            except ImportError as exc:
+                raise ImportError(
+                    "Install zstandard for .zst support: pip install ranger-core[zstd]"
+                ) from exc
+            dctx = zstd.ZstdDecompressor()
+            raw = open(path, "rb")
+            return dctx.stream_reader(raw)  # type: ignore[return-value]
+
+        if compression == "zip":
+            zf = zipfile.ZipFile(path, "r")
+            names = zf.namelist()
+            if not names:
+                raise ValueError(f"ZIP archive is empty: {path}")
+            # Read the first file in the archive
+            logger.debug("ZIP archive %s: reading entry '%s'", path, names[0])
+            return zf.open(names[0])  # type: ignore[return-value]
+
+        # No compression
+        return open(path, mode)  # noqa: SIM115
 
     # ------------------------------------------------------------------
     # Format readers
     # ------------------------------------------------------------------
 
     def _read_csv(self, path: Path) -> Iterator[Record]:
-        opener = self._get_opener(path)
-        with opener(path) as f:
+        with self._open_file(path, "rb") as f:
+            text_stream = io.TextIOWrapper(f, encoding="utf-8")
             reader = csv.DictReader(
-                io.TextIOWrapper(f) if isinstance(f, (gzip.GzipFile, io.BytesIO)) else f,
+                text_stream,
                 delimiter=self._config.get("csv_delimiter", ","),
             )
             for row in reader:
                 yield Record(data=dict(row), source_metadata={"file": str(path)})
 
     def _read_json(self, path: Path) -> Iterator[Record]:
-        with open(path, "rb") as f:
+        with self._open_file(path, "rb") as f:
             content = f.read()
         data = json.loads(content)
         if isinstance(data, list):
@@ -191,23 +262,23 @@ class FileSource(BaseSource):
             yield Record(data=data, source_metadata={"file": str(path)})
 
     def _read_ndjson(self, path: Path) -> Iterator[Record]:
-        import orjson
-
-        with open(path, "rb") as f:
-            for line in f:
-                line = line.strip()
+        with self._open_file(path, "rb") as f:
+            for raw_line in f:
+                line = raw_line.strip() if isinstance(raw_line, bytes) else raw_line.strip().encode()
                 if line:
-                    data = orjson.loads(line)
+                    data = json.loads(line)
                     yield Record(data=data, source_metadata={"file": str(path)})
 
     def _read_parquet(self, path: Path) -> Iterator[Record]:
-        import pyarrow.parquet as pq
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError(
+                "Install pyarrow for Parquet support: pip install ranger-core[parquet]"
+            ) from exc
 
         table = pq.read_table(str(path))
         for batch in table.to_batches():
-            for row in batch.to_pydict().values():
-                pass
-            # Convert columnar to row-based
             columns = batch.to_pydict()
             n_rows = batch.num_rows
             for i in range(n_rows):
@@ -232,7 +303,10 @@ class FileSource(BaseSource):
             raise ImportError("Install lxml: pip install ranger-core[xml]") from exc
 
         record_tag = self._config.get("xml_record_tag", None)
-        tree = etree.parse(str(path))
+
+        # Read through compression layer if needed
+        with self._open_file(path, "rb") as f:
+            tree = etree.parse(f)
 
         if record_tag:
             elements = tree.findall(f".//{record_tag}")
@@ -251,6 +325,8 @@ class FileSource(BaseSource):
             raise ImportError("Install openpyxl: pip install ranger-core[excel]") from exc
 
         sheet_name = self._config.get("excel_sheet", 0)
+        header_row = self._config.get("excel_header_row", 1)
+
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
 
         if isinstance(sheet_name, int):
@@ -259,16 +335,34 @@ class FileSource(BaseSource):
             ws = wb[sheet_name]
 
         rows = ws.iter_rows(values_only=True)
-        headers = [str(h) if h else f"col_{i}" for i, h in enumerate(next(rows))]
+
+        # Skip rows before the header row
+        for _ in range(header_row - 1):
+            next(rows, None)
+
+        header_values = next(rows, None)
+        if header_values is None:
+            wb.close()
+            return
+
+        headers = [str(h) if h else f"col_{i}" for i, h in enumerate(header_values)]
 
         for row in rows:
             data = dict(zip(headers, row))
-            yield Record(data=data, source_metadata={"file": str(path), "sheet": str(sheet_name)})
+            yield Record(
+                data=data,
+                source_metadata={"file": str(path), "sheet": str(sheet_name)},
+            )
 
         wb.close()
 
     def _read_orc(self, path: Path) -> Iterator[Record]:
-        import pyarrow.orc as orc
+        try:
+            import pyarrow.orc as orc
+        except ImportError as exc:
+            raise ImportError(
+                "Install pyarrow for ORC support: pip install ranger-core[orc]"
+            ) from exc
 
         table = orc.read_table(str(path))
         columns = table.to_pydict()
@@ -280,13 +374,6 @@ class FileSource(BaseSource):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _get_opener(path: Path):
-        """Return the appropriate file opener based on extension."""
-        if path.suffix.lower() == ".gz":
-            return lambda p: gzip.open(p, "rb")
-        return lambda p: open(p, "r")
 
     @staticmethod
     def _infer_column_type(key: str, sample: list[dict[str, Any]]) -> ColumnType:
@@ -310,7 +397,7 @@ class FileSource(BaseSource):
         return ColumnType.STRING
 
     @staticmethod
-    def _xml_element_to_dict(elem) -> dict[str, Any]:
+    def _xml_element_to_dict(elem: Any) -> dict[str, Any]:
         """Convert an XML element and its children to a dict."""
         result: dict[str, Any] = {}
         # Attributes
