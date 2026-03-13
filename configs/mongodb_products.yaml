@@ -1,0 +1,35 @@
+# Ranger pipeline: Read products from MongoDB → write to local JSON
+# Usage: ranger run --config configs/mongodb_products.yaml
+
+pipeline:
+  name: mongo_products
+  version: "1.0"
+  description: "Extract product catalog from MongoDB"
+  owner: "ranger-team"
+  tags: ["nosql", "mongodb"]
+
+source:
+  type: mongodb
+  config:
+    connection_string: "mongodb://ranger:ranger@mongodb:27017/ranger_dev?authSource=admin"
+    database: ranger_dev
+    collection: products
+    filter: {}
+    batch_size: 5000
+
+engine:
+  type: batch
+  config:
+    chunk_size: 5000
+
+schema:
+  registry: duckdb
+  drift_handling:
+    compatible: auto_evolve
+    breaking: quarantine
+
+sink:
+  type: local
+  config:
+    path: "./output/mongo_products"
+    format: json

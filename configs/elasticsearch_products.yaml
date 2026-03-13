@@ -1,0 +1,36 @@
+# Ranger pipeline: Read products from Elasticsearch → write to local JSON
+# Usage: ranger run --config configs/elasticsearch_products.yaml
+
+pipeline:
+  name: es_products
+  version: "1.0"
+  description: "Extract product index from Elasticsearch"
+  owner: "ranger-team"
+  tags: ["elasticsearch", "search"]
+
+source:
+  type: elasticsearch
+  config:
+    hosts: ["http://elasticsearch:9200"]
+    index: products
+    query:
+      match_all: {}
+    scroll_timeout: "5m"
+    batch_size: 1000
+
+engine:
+  type: batch
+  config:
+    chunk_size: 5000
+
+schema:
+  registry: duckdb
+  drift_handling:
+    compatible: auto_evolve
+    breaking: quarantine
+
+sink:
+  type: local
+  config:
+    path: "./output/es_products"
+    format: json

@@ -1,0 +1,35 @@
+# Ranger pipeline: Read orders from PostgreSQL → write to local JSON
+# Usage: ranger run --config configs/postgres_orders.yaml
+
+pipeline:
+  name: postgres_orders
+  version: "1.0"
+  description: "Extract orders from PostgreSQL (incremental)"
+  owner: "ranger-team"
+  tags: ["relational", "postgres", "incremental"]
+
+source:
+  type: relational
+  config:
+    connection_string: "postgresql+psycopg2://ranger:ranger@postgres:5432/ranger_dev"
+    table: orders
+    schema: public
+    incremental_column: updated_at
+    batch_size: 5000
+
+engine:
+  type: batch
+  config:
+    chunk_size: 5000
+
+schema:
+  registry: duckdb
+  drift_handling:
+    compatible: auto_evolve
+    breaking: quarantine
+
+sink:
+  type: local
+  config:
+    path: "./output/postgres_orders"
+    format: json

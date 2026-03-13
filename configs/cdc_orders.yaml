@@ -1,0 +1,57 @@
+# Ranger pipeline: Consume Debezium CDC events from Kafka → write to local JSON
+# Usage: ranger run --config configs/cdc_orders.yaml
+#
+# Prerequisites:
+#   1. docker compose up -d
+#   2. Register the Debezium PostgreSQL connector:
+#
+#      curl -X POST http://localhost:8083/connectors -H 'Content-Type: application/json' -d '{
+#        "name": "ranger-pg-cdc",
+#        "config": {
+#          "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+#          "database.hostname": "postgres",
+#          "database.port": "5432",
+#          "database.user": "ranger",
+#          "database.password": "ranger",
+#          "database.dbname": "ranger_dev",
+#          "topic.prefix": "ranger",
+#          "table.include.list": "public.orders",
+#          "plugin.name": "pgoutput"
+#        }
+#      }'
+#
+#   3. Make changes to the orders table in PostgreSQL to generate CDC events.
+
+pipeline:
+  name: cdc_orders
+  version: "1.0"
+  description: "Capture order changes via Debezium CDC"
+  owner: "ranger-team"
+  tags: ["cdc", "kafka", "debezium"]
+
+source:
+  type: cdc
+  config:
+    bootstrap_servers: "kafka:29092"
+    topic: "ranger.public.orders"
+    group_id: "ranger-cdc-orders"
+    auto_offset_reset: earliest
+    max_messages: 100
+    poll_timeout: 2.0
+
+engine:
+  type: batch
+  config:
+    chunk_size: 1000
+
+schema:
+  registry: duckdb
+  drift_handling:
+    compatible: auto_evolve
+    breaking: quarantine
+
+sink:
+  type: local
+  config:
+    path: "./output/cdc_orders"
+    format: json
